@@ -119,6 +119,11 @@ private:
    int  PackDof(int entity, int index, int edof) const;
    void UnpackDof(int dof, int &entity, int &index, int &edof) const;
 
+#ifdef MFEM_PMATRIX_STATS
+   mutable int n_msgs_sent, n_msgs_recv;
+   mutable int n_rows_sent, n_rows_recv, n_rows_fwd;
+#endif
+
    void ScheduleSendRow(const struct PMatrixRow &row, int dof, GroupId group_id,
                         std::map<int, class NeighborRowMessage> &send_msg) const;
 
@@ -182,7 +187,7 @@ public:
 
    /** @brief Copy constructor: deep copy all data from @a orig except the
        ParMesh, the FiniteElementCollection, and some derived data. */
-   /** If the @a pmesh or @a fec poiters are NULL (default), then the new
+   /** If the @a pmesh or @a fec pointers are NULL (default), then the new
        ParFiniteElementSpace will reuse the respective pointers from @a orig. If
        any of these pointers is not NULL, the given pointer will be used instead
        of the one used by @a orig.
@@ -205,7 +210,7 @@ public:
    ParFiniteElementSpace(const FiniteElementSpace &orig, ParMesh &pmesh,
                          const FiniteElementCollection *fec = NULL);
 
-   /** @brief Construct the *local* ParFiniteElementSpace corresponing to the
+   /** @brief Construct the *local* ParFiniteElementSpace corresponding to the
        global FE space, @a global_fes. */
    /** The parameter @a pm is the *local* ParMesh obtained by decomposing the
        global Mesh used by @a global_fes. The array @a partitioning represents
@@ -360,6 +365,8 @@ public:
 
    virtual ~ParFiniteElementSpace() { Destroy(); }
 
+   void PrintPartitionStats();
+
    // Obsolete, kept for backward compatibility
    int TrueVSize() const { return ltdof_size; }
 };
@@ -374,6 +381,52 @@ protected:
 
 public:
    ConformingProlongationOperator(const ParFiniteElementSpace &pfes);
+
+   virtual void Mult(const Vector &x, Vector &y) const;
+
+   virtual void MultTranspose(const Vector &x, Vector &y) const;
+};
+
+/// Auxiliary device class used by ParFiniteElementSpace.
+class DeviceConformingProlongationOperator: public
+   ConformingProlongationOperator
+{
+protected:
+   bool mpi_gpu_aware;
+   Array<int> shr_ltdof, ext_ldof;
+   mutable Vector shr_buf, ext_buf;
+   int *shr_buf_offsets, *ext_buf_offsets;
+   Array<int> ltdof_ldof, unq_ltdof;
+   Array<int> unq_shr_i, unq_shr_j;
+   MPI_Request *requests;
+   // Kernel: copy ltdofs from 'src' to 'shr_buf' - prepare for send.
+   //         shr_buf[i] = src[shr_ltdof[i]]
+   void BcastBeginCopy(const Vector &src) const;
+
+   // Kernel: copy ltdofs from 'src' to ldofs in 'dst'.
+   //         dst[ltdof_ldof[i]] = src[i]
+   void BcastLocalCopy(const Vector &src, Vector &dst) const;
+
+   // Kernel: copy ext. dofs from 'ext_buf' to 'dst' - after recv.
+   //         dst[ext_ldof[i]] = ext_buf[i]
+   void BcastEndCopy(Vector &dst) const;
+
+   // Kernel: copy ext. dofs from 'src' to 'ext_buf' - prepare for send.
+   //         ext_buf[i] = src[ext_ldof[i]]
+   void ReduceBeginCopy(const Vector &src) const;
+
+   // Kernel: copy owned ldofs from 'src' to ltdofs in 'dst'.
+   //         dst[i] = src[ltdof_ldof[i]]
+   void ReduceLocalCopy(const Vector &src, Vector &dst) const;
+
+   // Kernel: assemble dofs from 'shr_buf' into to 'dst' - after recv.
+   //         dst[shr_ltdof[i]] += shr_buf[i]
+   void ReduceEndAssemble(Vector &dst) const;
+
+public:
+   DeviceConformingProlongationOperator(const ParFiniteElementSpace &pfes);
+
+   virtual ~DeviceConformingProlongationOperator();
 
    virtual void Mult(const Vector &x, Vector &y) const;
 

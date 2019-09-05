@@ -14,6 +14,7 @@
 #ifdef MFEM_USE_MPI
 
 #include "pfespace.hpp"
+#include "../general/forall.hpp"
 #include "../general/sort_pairs.hpp"
 #include "../mesh/mesh_headers.hpp"
 #include "../general/binaryio.hpp"
@@ -143,7 +144,7 @@ void ParFiniteElementSpace::Construct()
       // Initialize 'gcomm' for the cut (aka "partially conforming") space.
       // In the process, the array 'ldof_ltdof' is also initialized (for the cut
       // space) and used; however, it will be overwritten below with the real
-      // true dofs. Also, 'ldof_sign' and 'ldof_group' are contructed for the
+      // true dofs. Also, 'ldof_sign' and 'ldof_group' are constructed for the
       // cut space.
       ConstructTrueDofs();
 
@@ -175,6 +176,45 @@ void ParFiniteElementSpace::Construct()
       // TODO future: split BuildParallelConformingInterpolation into two parts
       // to overlap its communication with processing between this constructor
       // and the point where the P matrix is actually needed.
+   }
+}
+
+void ParFiniteElementSpace::PrintPartitionStats()
+{
+   long ltdofs = ltdof_size;
+   long min_ltdofs, max_ltdofs, sum_ltdofs;
+
+   MPI_Reduce(&ltdofs, &min_ltdofs, 1, MPI_LONG, MPI_MIN, 0, MyComm);
+   MPI_Reduce(&ltdofs, &max_ltdofs, 1, MPI_LONG, MPI_MAX, 0, MyComm);
+   MPI_Reduce(&ltdofs, &sum_ltdofs, 1, MPI_LONG, MPI_SUM, 0, MyComm);
+
+   if (MyRank == 0)
+   {
+      double avg = double(sum_ltdofs) / NRanks;
+      mfem::out << "True DOF partitioning: min " << min_ltdofs
+                << ", avg " << std::fixed << std::setprecision(1) << avg
+                << ", max " << max_ltdofs
+                << ", (max-avg)/avg " << 100.0*(max_ltdofs - avg)/avg
+                << "%" << std::endl;
+   }
+
+   if (NRanks <= 32)
+   {
+      if (MyRank == 0)
+      {
+         mfem::out << "True DOFs by rank: " << ltdofs;
+         for (int i = 1; i < NRanks; i++)
+         {
+            MPI_Status status;
+            MPI_Recv(&ltdofs, 1, MPI_LONG, i, 123, MyComm, &status);
+            mfem::out << " " << ltdofs;
+         }
+         mfem::out << "\n";
+      }
+      else
+      {
+         MPI_Send(&ltdofs, 1, MPI_LONG, 0, 123, MyComm);
+      }
    }
 }
 
@@ -708,12 +748,14 @@ void ParFiniteElementSpace::GetEssentialTrueDofs(const Array<int>
    // Verify that in boolean arithmetic: P^T ess_dofs = R ess_dofs.
    Array<int> true_ess_dofs2(true_ess_dofs.Size());
    HypreParMatrix *Pt = Dof_TrueDof_Matrix()->Transpose();
-   Pt->BooleanMult(1, ess_dofs, 0, true_ess_dofs2);
+   const int *ess_dofs_data = ess_dofs.HostRead();
+   Pt->BooleanMult(1, ess_dofs_data, 0, true_ess_dofs2);
    delete Pt;
    int counter = 0;
+   const int *ted = true_ess_dofs.HostRead();
    for (int i = 0; i < true_ess_dofs.Size(); i++)
    {
-      if (bool(true_ess_dofs[i]) != bool(true_ess_dofs2[i])) { counter++; }
+      if (bool(ted[i]) != bool(true_ess_dofs2[i])) { counter++; }
    }
    MFEM_VERIFY(counter == 0, "internal MFEM error: counter = " << counter);
 #endif
@@ -815,7 +857,20 @@ const Operator *ParFiniteElementSpace::GetProlongationMatrix() const
 {
    if (Conforming())
    {
-      if (!Pconf) { Pconf = new ConformingProlongationOperator(*this); }
+      if (!Pconf)
+      {
+         if (!Device::Allows(Backend::CUDA))
+         {
+            Pconf = new ConformingProlongationOperator(*this);
+         }
+         else
+         {
+            if (NRanks > 1)
+            {
+               Pconf = new DeviceConformingProlongationOperator(*this);
+            }
+         }
+      }
       return Pconf;
    }
    else
@@ -863,11 +918,15 @@ void ParFiniteElementSpace::ExchangeFaceNbrData()
       {
          GetElementVDofs(my_elems[i], ldofs);
          for (int j = 0; j < ldofs.Size(); j++)
-            if (ldof_marker[ldofs[j]] != fn)
+         {
+            int ldof = (ldofs[j] >= 0 ? ldofs[j] : -1-ldofs[j]);
+
+            if (ldof_marker[ldof] != fn)
             {
-               ldof_marker[ldofs[j]] = fn;
+               ldof_marker[ldof] = fn;
                send_face_nbr_ldof.AddAColumnInRow(fn);
             }
+         }
          send_nbr_elem_dof.AddColumnsInRow(send_el_off[fn] + i, ldofs.Size());
       }
 
@@ -921,9 +980,11 @@ void ParFiniteElementSpace::ExchangeFaceNbrData()
          GetElementVDofs(my_elems[i], ldofs);
          for (int j = 0; j < ldofs.Size(); j++)
          {
-            if (ldof_marker[ldofs[j]] != fn)
+            int ldof = (ldofs[j] >= 0 ? ldofs[j] : -1-ldofs[j]);
+
+            if (ldof_marker[ldof] != fn)
             {
-               ldof_marker[ldofs[j]] = fn;
+               ldof_marker[ldof] = fn;
                send_face_nbr_ldof.AddConnection(fn, ldofs[j]);
             }
          }
@@ -944,12 +1005,14 @@ void ParFiniteElementSpace::ExchangeFaceNbrData()
 
       for (int i = 0; i < num_ldofs; i++)
       {
-         ldof_marker[ldofs[i]] = i;
+         int ldof = (ldofs[i] >= 0 ? ldofs[i] : -1-ldofs[i]);
+         ldof_marker[ldof] = i;
       }
 
       for ( ; j < j_end; j++)
       {
-         send_J[j] = ldof_marker[send_J[j]];
+         int ldof = (send_J[j] >= 0 ? send_J[j] : -1-send_J[j]);
+         send_J[j] = (send_J[j] >= 0 ? ldof_marker[ldof] : -1-ldof_marker[ldof]);
       }
    }
 
@@ -984,7 +1047,14 @@ void ParFiniteElementSpace::ExchangeFaceNbrData()
 
       for ( ; j < j_end; j++)
       {
-         recv_J[j] += shift;
+         if (recv_J[j] >= 0)
+         {
+            recv_J[j] += shift;
+         }
+         else
+         {
+            recv_J[j] -= shift;
+         }
       }
    }
 
@@ -1033,8 +1103,15 @@ void ParFiniteElementSpace::ExchangeFaceNbrData()
    for (int fn = 0, j = 0; fn < num_face_nbrs; fn++)
    {
       for (int j_end = face_nbr_ldof.GetI()[fn+1]; j < j_end; j++)
-         face_nbr_glob_dof_map[j] =
-            dof_face_nbr_offsets[fn] + face_nbr_ldof.GetJ()[j];
+      {
+         int ldof = face_nbr_ldof.GetJ()[j];
+         if (ldof < 0)
+         {
+            ldof = -1-ldof;
+         }
+
+         face_nbr_glob_dof_map[j] = dof_face_nbr_offsets[fn] + ldof;
+      }
    }
 
    MPI_Waitall(num_face_nbrs, send_requests, statuses);
@@ -1717,6 +1794,9 @@ ParFiniteElementSpace::ScheduleSendRow(const PMatrixRow &row, int dof,
          msg.AddRow(ent, idx, edof, group_id, row);
          msg.SetNCMesh(pncmesh);
          msg.SetFEC(fec);
+#ifdef MFEM_PMATRIX_STATS
+         n_rows_sent++;
+#endif
       }
    }
 }
@@ -1739,7 +1819,9 @@ void ParFiniteElementSpace::ForwardRow(const PMatrixRow &row, int dof,
          msg.AddRow(ent, idx, edof, invalid, row);
          msg.SetNCMesh(pncmesh);
          msg.SetFEC(fec);
-
+#ifdef MFEM_PMATRIX_STATS
+         n_rows_fwd++;
+#endif
 #ifdef MFEM_DEBUG_PMATRIX
          mfem::out << "Rank " << pncmesh->GetMyRank() << " forwarding to "
                    << rank << ": ent " << ent << ", index" << idx
@@ -1820,6 +1902,11 @@ int ParFiniteElementSpace
                                        bool partial) const
 {
    bool dg = (nvdofs == 0 && nedofs == 0 && nfdofs == 0);
+
+#ifdef MFEM_PMATRIX_STATS
+   n_msgs_sent = n_msgs_recv = 0;
+   n_rows_sent = n_rows_recv = n_rows_fwd = 0;
+#endif
 
    // *** STEP 1: build master-slave dependency lists ***
 
@@ -1999,6 +2086,9 @@ int ParFiniteElementSpace
 
    // send identity rows
    NeighborRowMessage::IsendAll(send_msg.back(), MyComm);
+#ifdef MFEM_PMATRIX_STATS
+   n_msgs_sent += send_msg.back().size();
+#endif
 
    if (R) { (*R)->Finalize(); }
 
@@ -2026,6 +2116,10 @@ int ParFiniteElementSpace
       while (NeighborRowMessage::IProbe(rank, size, MyComm))
       {
          recv_msg.Recv(rank, size, MyComm);
+#ifdef MFEM_PMATRIX_STATS
+         n_msgs_recv++;
+         n_rows_recv += recv_msg.GetRows().size();
+#endif
 
          const NeighborRowMessage::RowInfo::List &rows = recv_msg.GetRows();
          for (unsigned i = 0; i < rows.size(); i++)
@@ -2100,6 +2194,9 @@ int ParFiniteElementSpace
 
       // send current batch of messages
       NeighborRowMessage::IsendAll(send_msg.back(), MyComm);
+#ifdef MFEM_PMATRIX_STATS
+      n_msgs_sent += send_msg.back().size();
+#endif
    }
 
    if (P)
@@ -2122,6 +2219,31 @@ int ParFiniteElementSpace
    {
       NeighborRowMessage::WaitAllSent(*it);
    }
+
+#ifdef MFEM_PMATRIX_STATS
+   int n_rounds = send_msg.size();
+   int glob_rounds, glob_msgs_sent, glob_msgs_recv;
+   int glob_rows_sent, glob_rows_recv, glob_rows_fwd;
+
+   MPI_Reduce(&n_rounds,    &glob_rounds,    1, MPI_INT, MPI_SUM, 0, MyComm);
+   MPI_Reduce(&n_msgs_sent, &glob_msgs_sent, 1, MPI_INT, MPI_SUM, 0, MyComm);
+   MPI_Reduce(&n_msgs_recv, &glob_msgs_recv, 1, MPI_INT, MPI_SUM, 0, MyComm);
+   MPI_Reduce(&n_rows_sent, &glob_rows_sent, 1, MPI_INT, MPI_SUM, 0, MyComm);
+   MPI_Reduce(&n_rows_recv, &glob_rows_recv, 1, MPI_INT, MPI_SUM, 0, MyComm);
+   MPI_Reduce(&n_rows_fwd,  &glob_rows_fwd,  1, MPI_INT, MPI_SUM, 0, MyComm);
+
+   if (MyRank == 0)
+   {
+      mfem::out << "P matrix stats (avg per rank): "
+                << double(glob_rounds)/NRanks << " rounds, "
+                << double(glob_msgs_sent)/NRanks << " msgs sent, "
+                << double(glob_msgs_recv)/NRanks << " msgs recv, "
+                << double(glob_rows_sent)/NRanks << " rows sent, "
+                << double(glob_rows_recv)/NRanks << " rows recv, "
+                << double(glob_rows_fwd)/NRanks << " rows forwarded."
+                << std::endl;
+   }
+#endif
 
    return num_true_dofs*vdim;
 }
@@ -2779,8 +2901,8 @@ void ConformingProlongationOperator::Mult(const Vector &x, Vector &y) const
    MFEM_ASSERT(x.Size() == Width(), "");
    MFEM_ASSERT(y.Size() == Height(), "");
 
-   const double *xdata = x.GetData();
-   double *ydata = y.GetData();
+   const double *xdata = x.HostRead();
+   double *ydata = y.HostWrite();
    const int m = external_ldofs.Size();
 
    const int in_layout = 2; // 2 - input is ltdofs array
@@ -2805,8 +2927,8 @@ void ConformingProlongationOperator::MultTranspose(
    MFEM_ASSERT(x.Size() == Height(), "");
    MFEM_ASSERT(y.Size() == Width(), "");
 
-   const double *xdata = x.GetData();
-   double *ydata = y.GetData();
+   const double *xdata = x.HostRead();
+   double *ydata = y.HostWrite();
    const int m = external_ldofs.Size();
 
    gc.ReduceBegin(xdata);
@@ -2822,6 +2944,242 @@ void ConformingProlongationOperator::MultTranspose(
 
    const int out_layout = 2; // 2 - output is an array on all ltdofs
    gc.ReduceEnd<double>(ydata, out_layout, GroupCommunicator::Sum);
+}
+
+DeviceConformingProlongationOperator::DeviceConformingProlongationOperator(
+   const ParFiniteElementSpace &pfes) :
+   ConformingProlongationOperator(pfes),
+   mpi_gpu_aware(Device::GetGPUAwareMPI())
+{
+   MFEM_ASSERT(pfes.Conforming(), "internal error");
+   const SparseMatrix *R = pfes.GetRestrictionMatrix();
+   MFEM_ASSERT(R->Finalized(), "");
+   const int tdofs = R->Height();
+   MFEM_ASSERT(tdofs == pfes.GetTrueVSize(), "");
+   MFEM_ASSERT(tdofs == R->GetI()[tdofs], "");
+   ltdof_ldof = Array<int>(const_cast<int*>(R->GetJ()), tdofs);
+   ltdof_ldof.UseDevice();
+   {
+      Table nbr_ltdof;
+      gc.GetNeighborLTDofTable(nbr_ltdof);
+      const int nb_connections = nbr_ltdof.Size_of_connections();
+      shr_ltdof.SetSize(nb_connections);
+      shr_ltdof.CopyFrom(nbr_ltdof.GetJ());
+      shr_buf.SetSize(nb_connections);
+      shr_buf.UseDevice(true);
+      shr_buf_offsets = nbr_ltdof.GetI();
+      {
+         Array<int> shr_ltdof(nbr_ltdof.GetJ(), nb_connections);
+         Array<int> unique_ltdof(shr_ltdof);
+         unique_ltdof.Sort();
+         unique_ltdof.Unique();
+         // Note: the next loop modifies the J array of nbr_ltdof
+         for (int i = 0; i < shr_ltdof.Size(); i++)
+         {
+            shr_ltdof[i] = unique_ltdof.FindSorted(shr_ltdof[i]);
+            MFEM_ASSERT(shr_ltdof[i] != -1, "internal error");
+         }
+         Table unique_shr;
+         Transpose(shr_ltdof, unique_shr, unique_ltdof.Size());
+         unq_ltdof = Array<int>(unique_ltdof, unique_ltdof.Size());
+         unq_shr_i = Array<int>(unique_shr.GetI(), unique_shr.Size()+1);
+         unq_shr_j = Array<int>(unique_shr.GetJ(), unique_shr.Size_of_connections());
+      }
+      delete [] nbr_ltdof.GetJ();
+      nbr_ltdof.LoseData();
+   }
+   {
+      Table nbr_ldof;
+      gc.GetNeighborLDofTable(nbr_ldof);
+      const int nb_connections = nbr_ldof.Size_of_connections();
+      ext_ldof.SetSize(nb_connections);
+      ext_ldof.CopyFrom(nbr_ldof.GetJ());
+      ext_buf.SetSize(nb_connections);
+      ext_buf.UseDevice(true);
+      ext_buf_offsets = nbr_ldof.GetI();
+      delete [] nbr_ldof.GetJ();
+      nbr_ldof.LoseData();
+   }
+   const GroupTopology &gtopo = gc.GetGroupTopology();
+   int req_counter = 0;
+   for (int nbr = 1; nbr < gtopo.GetNumNeighbors(); nbr++)
+   {
+      const int send_offset = shr_buf_offsets[nbr];
+      const int send_size = shr_buf_offsets[nbr+1] - send_offset;
+      if (send_size > 0) { req_counter++; }
+
+      const int recv_offset = ext_buf_offsets[nbr];
+      const int recv_size = ext_buf_offsets[nbr+1] - recv_offset;
+      if (recv_size > 0) { req_counter++; }
+   }
+   requests = new MPI_Request[req_counter];
+}
+
+static void ExtractSubVector(const int N,
+                             const Array<int> &indices,
+                             const Vector &in, Vector &out)
+{
+   auto y = out.Write();
+   const auto x = in.Read();
+   const auto I = indices.Read();
+   MFEM_FORALL(i, N, y[i] = x[I[i]];); // indices can be repeated
+}
+
+void DeviceConformingProlongationOperator::BcastBeginCopy(
+   const Vector &x) const
+{
+   // shr_buf[i] = src[shr_ltdof[i]]
+   if (shr_ltdof.Size() == 0) { return; }
+   ExtractSubVector(shr_ltdof.Size(), shr_ltdof, x, shr_buf);
+   // If the above kernel is executed asynchronously, we should wait for it to
+   // complete
+   if (mpi_gpu_aware) { Device::Synchronize(); }
+}
+
+static void SetSubVector(const int N,
+                         const Array<int> &indices,
+                         const Vector &in, Vector &out)
+{
+   auto y = out.Write();
+   const auto x = in.Read();
+   const auto I = indices.Read();
+   MFEM_FORALL(i, N, y[I[i]] = x[i];);
+}
+
+void DeviceConformingProlongationOperator::BcastLocalCopy(
+   const Vector &x, Vector &y) const
+{
+   // dst[ltdof_ldof[i]] = src[i]
+   if (ltdof_ldof.Size() == 0) { return; }
+   SetSubVector(ltdof_ldof.Size(), ltdof_ldof, x, y);
+}
+
+void DeviceConformingProlongationOperator::BcastEndCopy(
+   Vector &y) const
+{
+   // dst[ext_ldof[i]] = ext_buf[i]
+   if (ext_ldof.Size() == 0) { return; }
+   SetSubVector(ext_ldof.Size(), ext_ldof, ext_buf, y);
+}
+
+void DeviceConformingProlongationOperator::Mult(const Vector &x,
+                                                Vector &y) const
+{
+   const GroupTopology &gtopo = gc.GetGroupTopology();
+   BcastBeginCopy(x); // copy to 'shr_buf'
+   int req_counter = 0;
+   for (int nbr = 1; nbr < gtopo.GetNumNeighbors(); nbr++)
+   {
+      const int send_offset = shr_buf_offsets[nbr];
+      const int send_size = shr_buf_offsets[nbr+1] - send_offset;
+      if (send_size > 0)
+      {
+         auto send_buf = mpi_gpu_aware ? shr_buf.Read() : shr_buf.HostRead();
+         MPI_Isend(send_buf + send_offset, send_size, MPI_DOUBLE,
+                   gtopo.GetNeighborRank(nbr), 41822,
+                   gtopo.GetComm(), &requests[req_counter++]);
+      }
+      const int recv_offset = ext_buf_offsets[nbr];
+      const int recv_size = ext_buf_offsets[nbr+1] - recv_offset;
+      if (recv_size > 0)
+      {
+         auto recv_buf = mpi_gpu_aware ? ext_buf.Write() : ext_buf.HostWrite();
+         MPI_Irecv(recv_buf + recv_offset, recv_size, MPI_DOUBLE,
+                   gtopo.GetNeighborRank(nbr), 41822,
+                   gtopo.GetComm(), &requests[req_counter++]);
+      }
+   }
+   BcastLocalCopy(x, y);
+   MPI_Waitall(req_counter, requests, MPI_STATUSES_IGNORE);
+   BcastEndCopy(y); // copy from 'ext_buf'
+}
+
+DeviceConformingProlongationOperator::~DeviceConformingProlongationOperator()
+{
+   delete [] requests;
+   delete [] ext_buf_offsets;
+   delete [] shr_buf_offsets;
+}
+
+void DeviceConformingProlongationOperator::ReduceBeginCopy(
+   const Vector &x) const
+{
+   // ext_buf[i] = src[ext_ldof[i]]
+   if (ext_ldof.Size() == 0) { return; }
+   ExtractSubVector(ext_ldof.Size(), ext_ldof, x, ext_buf);
+   // If the above kernel is executed asynchronously, we should wait for it to
+   // complete
+   if (mpi_gpu_aware) { Device::Synchronize(); }
+}
+
+void DeviceConformingProlongationOperator::ReduceLocalCopy(
+   const Vector &x, Vector &y) const
+{
+   // dst[i] = src[ltdof_ldof[i]]
+   if (ltdof_ldof.Size() == 0) { return; }
+   ExtractSubVector(ltdof_ldof.Size(), ltdof_ldof, x, y);
+}
+
+static void AddSubVector(const int num_unique_dst_indices,
+                         const Array<int> &unique_dst_indices,
+                         const Array<int> &unique_to_src_offsets,
+                         const Array<int> &unique_to_src_indices,
+                         const Vector &src,
+                         Vector &dst)
+{
+   auto y = dst.Write();
+   const auto x = src.Read();
+   const auto DST_I = unique_dst_indices.Read();
+   const auto SRC_O = unique_to_src_offsets.Read();
+   const auto SRC_I = unique_to_src_indices.Read();
+   MFEM_FORALL(i, num_unique_dst_indices,
+   {
+      const int dst_idx = DST_I[i];
+      double sum = y[dst_idx];
+      const int end = SRC_O[i+1];
+      for (int j = SRC_O[i]; j != end; ++j) { sum += x[SRC_I[j]]; }
+      y[dst_idx] = sum;
+   });
+}
+
+void DeviceConformingProlongationOperator::ReduceEndAssemble(Vector &y) const
+{
+   // dst[shr_ltdof[i]] += shr_buf[i]
+   const int unq_ltdof_size = unq_ltdof.Size();
+   if (unq_ltdof_size == 0) { return; }
+   AddSubVector(unq_ltdof_size, unq_ltdof, unq_shr_i, unq_shr_j, shr_buf, y);
+}
+
+void DeviceConformingProlongationOperator::MultTranspose(const Vector &x,
+                                                         Vector &y) const
+{
+   const GroupTopology &gtopo = gc.GetGroupTopology();
+   ReduceBeginCopy(x); // copy to 'ext_buf'
+   int req_counter = 0;
+   for (int nbr = 1; nbr < gtopo.GetNumNeighbors(); nbr++)
+   {
+      const int send_offset = ext_buf_offsets[nbr];
+      const int send_size = ext_buf_offsets[nbr+1] - send_offset;
+      if (send_size > 0)
+      {
+         auto send_buf = mpi_gpu_aware ? ext_buf.Read() : ext_buf.HostRead();
+         MPI_Isend(send_buf + send_offset, send_size, MPI_DOUBLE,
+                   gtopo.GetNeighborRank(nbr), 41823,
+                   gtopo.GetComm(), &requests[req_counter++]);
+      }
+      const int recv_offset = shr_buf_offsets[nbr];
+      const int recv_size = shr_buf_offsets[nbr+1] - recv_offset;
+      if (recv_size > 0)
+      {
+         auto recv_buf = mpi_gpu_aware ? shr_buf.Write() : shr_buf.HostWrite();
+         MPI_Irecv(recv_buf + recv_offset, recv_size, MPI_DOUBLE,
+                   gtopo.GetNeighborRank(nbr), 41823,
+                   gtopo.GetComm(), &requests[req_counter++]);
+      }
+   }
+   ReduceLocalCopy(x, y);
+   MPI_Waitall(req_counter, requests, MPI_STATUSES_IGNORE);
+   ReduceEndAssemble(y); // assemble from 'shr_buf'
 }
 
 } // namespace mfem
